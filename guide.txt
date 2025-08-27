@@ -1,0 +1,237 @@
+Phase 0 — Baseline (you mostly have this)
+Fields in RaftNode:
+
+Persistent: int currentTerm; Integer votedFor; List<LogEntry> log;
+
+Volatile (all): int commitIndex; int lastApplied;
+
+Volatile (leader): int[] nextIndex; int[] matchIndex;
+
+Role: enum Role {FOLLOWER, CANDIDATE, LEADER} role;
+
+Peers & id: int id; List<RaftNode> peers;
+
+RPC handlers (receiver-side):
+
+boolean handleRequestVote(RequestVoteRequest rpc)
+
+boolean handleAppendEntries(AppendEntriesRequest rpc)
+(You already drafted these, incl. the conflict fix with subList().clear().)
+
+Helper:
+
+static final class LogEntry { int term; String command; }
+
+
+
+Phase 1 — Election timer & role transitions (no networking yet)
+Add a randomized election timer and the candidate->leader flow.
+
+New fields:
+
+long electionDeadlineMs;
+
+long heartbeatIntervalMs = 100;
+
+long now() (wrap System.currentTimeMillis() to ease testing)
+
+
+// dont till here
+Methods to implement:
+
+void resetElectionTimer() → set electionDeadlineMs = now() + random(150..300 ms)
+
+void tick() → called periodically (e.g., every 10–20ms)
+
+    if role != LEADER and now() >= electionDeadlineMs → startElection()
+
+void startElection():
+
+    role = CANDIDATE; currentTerm++; votedFor = id; resetElectionTimer();
+
+    int votes = 1; (self vote)
+
+    send RequestVoteRequest to all peers (see Phase 2 for “send”)
+
+        on responses:
+
+        if response.term > currentTerm → becomeFollower(response.term)
+
+        if voteGranted tally reaches majority → becomeLeader()
+
+void becomeFollower(int newTerm):
+
+role = FOLLOWER; currentTerm = newTerm; votedFor = null; resetElectionTimer();
+
+void becomeLeader():
+
+role = LEADER;
+
+init nextIndex[i] = log.size(); matchIndex[i] = -1;
+
+immediately sendHeartbeatsOnce() (empty AppendEntries)
+
+start leader heartbeat cadence (handled by tick(); see Phase 2)
+
+That’s enough to elect a leader in a 1–3 node cluster if you stub out “send”.
+
+Phase 2 — Outgoing RPCs (sender-side) & heartbeats
+Keep everything in-process for now (no sockets). Just call peer methods directly.
+
+Interface (in-process “RPC”):
+
+RequestVote send:
+
+RequestVoteResponse sendRequestVote(RaftNode peer, RequestVoteRequest req)
+(implementation: return peer.handleRequestVote(req))
+
+AppendEntries send:
+
+AppendEntriesResponse sendAppend(RaftNode peer, AppendEntriesRequest req)
+
+Leader heartbeat:
+
+In tick():
+
+if role == LEADER and now() - lastHeartbeatSent >= heartbeatIntervalMs:
+
+sendHeartbeatsOnce(); lastHeartbeatSent = now();
+
+void sendHeartbeatsOnce():
+
+for each follower f:
+
+compute prevLogIndex = nextIndex[f]-1
+
+prevLogTerm = (prevLogIndex >= 0 ? log.get(prevLogIndex).term : 0)
+
+entries = [] (empty heartbeat)
+
+send AppendEntriesRequest(term, id, prevLogIndex, prevLogTerm, entries, commitIndex)
+
+handle response:
+
+if resp.term > currentTerm → becomeFollower(resp.term)
+
+if resp.success == false → decrement nextIndex[f] (at least by 1; optimize later)
+
+This stabilizes leadership and keeps followers’ timers reset.
+
+Phase 3 — Client commands, replication, advancing commitIndex
+Now make the system actually replicate data.
+
+Client entry point (leader only):
+
+int onClientCommand(String command):
+
+assert role == LEADER
+
+log.add(new LogEntry(currentTerm, command))
+
+(option A minimal) immediately call replicateToAllFollowers()
+
+return the new entry’s index
+
+Replication (leader):
+
+void replicateToAllFollowers():
+
+for each follower f:
+
+int ni = nextIndex[f];
+
+prevLogIndex = ni - 1;
+
+prevLogTerm = (prevLogIndex >= 0 ? log.get(prevLogIndex).term : 0);
+
+entries = log.subList(ni, log.size())
+
+send AE; handle response:
+
+if resp.term > currentTerm → becomeFollower(resp.term); return;
+
+if resp.success:
+
+matchIndex[f] = log.size()-1;
+
+nextIndex[f] = log.size();
+
+else:
+
+nextIndex[f] = Math.max(0, nextIndex[f]-1); (basic backoff; optimize later)
+
+Advance commitIndex (leader): (the key Raft rule)
+
+void tryAdvanceCommitIndex():
+
+for N = log.size()-1 down to commitIndex+1:
+
+if log.get(N).term != currentTerm continue; // Raft §5.4.2
+
+count replicas: 1 + numberOfFollowersWith(matchIndex[f] >= N)
+
+if count >= majority:
+
+commitIndex = N;
+
+applyCommitted();
+
+break;
+
+Apply to state machine (all servers):
+
+void applyCommitted():
+
+while lastApplied < commitIndex:
+
+lastApplied++;
+
+apply log.get(lastApplied).command to your KV store / placeholder handler
+
+Follower-side AE handler already updates commitIndex using leaderCommit; you still run applyCommitted() after handleAppendEntries returns true.
+
+Wire-ups:
+
+Call tryAdvanceCommitIndex() at the end of replicateToAllFollowers() and also after any successful AE responses in sendHeartbeatsOnce() if you choose to piggyback entries.
+
+Phase 4 — Time & loops (how to run it)
+You need a tiny scheduler to call tick() and simulate time.
+
+Minimal driver (pseudo):
+
+Create List<RaftNode> nodes (size 3 or 5), wire peers by reference.
+
+Loop:
+
+for each node: node.tick();
+
+Thread.sleep(10);
+
+For testing client ops: call leader.onClientCommand("PUT x=1") after a leader emerges.
+
+This lets you test elections and replication without sockets/thread-per-peer complexity.
+
+Phase 5 — Correctness edges (keep for later)
+Stepping down on higher term: check term on every response (RV/AE) and in every handler.
+
+Election restrictions: reset timer on any valid AppendEntries / RequestVote grant.
+
+Duplicate client requests: add client IDs + sequence numbers (later).
+
+Optimized backtracking: install-term-based backjump (Raft optimization) later.
+
+Persistence: write currentTerm, votedFor, and appended entries to disk before replying (later).
+
+Snapshots: ignore until you have correctness locked.
+
+Minimal test plan (in this order)
+Single node elects itself leader, stays leader.
+
+Three nodes: leader election converges; followers reset timers on heartbeats.
+
+Replication: client command on leader → followers receive, commitIndex advances, applyCommitted runs.
+
+Leader crash: stop calling tick() for the leader; a follower wins; old uncommitted entries disappear; retries succeed.
+
+Conflict repair: Make a follower diverge, then let leader overwrite via your subList().clear() logic.
+
